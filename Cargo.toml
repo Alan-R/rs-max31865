@@ -1,7 +1,7 @@
 [package]
 name = "rs_max31865"
 version = "1.0.0"
-authors = ["Rudi Horn <dyn-git@rudi-horn.de>", "Emeric Martineau <11473190+emeric-martineau@users.noreply.github.com>"]
+authors = ["Rudi Horn <dyn-git@rudi-horn.de>", "Emeric Martineau <11473190+emeric-martineau@users.noreply.github.com>", "Alan Robertson <alanr@unix.sh>"]
 keywords = ["embedded-hal-v1", "rtd-sensor", "max31865"]
 categories = ["embedded", "no-std", "hardware-support"]
 description = "Generic driver for the MAX31865 RTD to Digital converter"
