@@ -1,334 +1,527 @@
-//! A generic driver for the MAX31865 RTD to Digital converter
+//! Opaque RTD driver for MAX31865 on Raspberry Pi.
+//! Hides all hardware details: user passes CS pin num + leads + filter Hz, gets temps in hundredths °C.
+//! We use traits to hide the hardware away in support of mocking
 //!
-//! # References
-//! - Datasheet: https://datasheets.maximintegrated.com/en/ds/MAX31865.pdf
+//! # Features
+//! - `mock`: Enables mock hardware for testing (stubs rppal interfaces; exercises same driver logic).
+//! - `no_fp`: Disables API calls that use floating point.
 
-#![cfg_attr(not(test), no_std)]
-extern crate alloc;
+use std::any::Any;
+use std::error::Error as StdError;
+use std::fmt;
+#[cfg(not(feature = "mock"))]
+use rppal::spi::{Bus, Mode, SlaveSelect, Error as SpiError};
+#[cfg(not(feature = "mock"))]
+use rppal::gpio::Gpio;
+#[cfg(feature = "mock")]
+use std::sync::Arc;
+#[cfg(feature = "mock")]
+use std::cell::RefCell;
 
-use alloc::vec::Vec;
-use embedded_hal::digital::{InputPin, OutputPin};
-use embedded_hal::spi::{Mode, Phase, Polarity, SpiBus};
-
-#[cfg(feature = "doc")]
-pub mod examples;
-
-pub const MODE: Mode = Mode {
-    phase: Phase::CaptureOnSecondTransition,
-    polarity: Polarity::IdleHigh,
-};
-
-pub mod temp_conversion;
-
-pub enum FilterMode {
-    /// Set for 60 hz mains in your country.
-    /// Temperature updated every 52 ms in continuous mode
-    Filter60Hz = 0,
-    /// Set for 50 hz mains in your country.
-    /// Temperature updated every 62.5 ms in continuous mode
-    Filter50Hz = 1,
-}
-
-pub enum SensorType {
-    /// For two or 4 wire setups - including using a test resistor.
-    /// For two wire setups, you need to configure jumpers to the outside pins.
-    TwoOrFourWire = 0,
-    /// For three wire sensors
-    ThreeWire = 1,
-}
-
-pub struct Max31865<SPI, NCS, RDY> {
-    spi: SPI,
-    ncs: NCS,
-    #[allow(unused)]
-    rdy: RDY, // Only required for the unsupported one-shot mode.
-    calibration: u32,
-}
-
-#[derive(Debug)]
-pub enum Error {
-    /// Error reading from the Max31856 chip registers
-    SpiErrorRead,
-    /// Erro writing from the Max31856 chip registers
-    SpiErrorWrite,
-    /// Error transferring data to/from Max31856 chip registers
-    SpiErrorTransfer,
-    /// Error setting the state of a pin in the GPIO bus
-    PinError,
-    /// Configuration parameters are invalid or unsupported.
-    ConfigError,
-    /// The Max31856 chip declared an error when converting temperatures.
-    /// Use `read_fault_status()` for details.
-    MAXError,
-}
-
-impl<SPI, NCS, RDY> Max31865<SPI, NCS, RDY>
-where
-    SPI: SpiBus<u8>,
-    NCS: OutputPin,
-    RDY: InputPin,
-{
-    /// Create a new MAX31865 module.
-    ///
-    /// # Arguments
-    ///
-    /// * `spi` - The SPI (Serial Peripheral Interface) module to communicate on.
-    /// * `ncs` - The Chip Select pin (NCS: Negative Chip Select - active low)
-    ///           which must be a push-pull output pin (`OutputPin`)
-    ///           Use `into_output_high()` or a pullup resistor for reliable operation.
-    /// * `rdy` - The Ready pin which is set low by the MAX31865 controller
-    ///           whenever it has finished converting the output.
-    ///           This pin is NOT USED in continuous sample mode (one_shot == 0).
-    ///
-    pub fn new(spi: SPI, mut ncs: NCS, rdy: RDY) -> Result<Max31865<SPI, NCS, RDY>, Error> {
-        let default_calib = 40000;
-
-        ncs.set_high().map_err(|_| Error::PinError)?;
-        let max31865 = Max31865 {
-            spi,
-            ncs,
-            rdy,
-            calibration: default_calib, /* value in ohms multiplied by 100 */
-        };
-
-        Ok(max31865)
+// Public opaque API - unchanged
+pub struct RtdReader {
+    inner: RtdInner,
     }
 
-    /// Updates the devices configuration.
-    ///
-    /// # Arguments
-    /// * `vbias` - Set to `true` to enable V_BIAS voltage, which is required to
-    ///             correctly perform conversion.Clone
-    /// * `conversion_mode` - `true` to automatically perform conversion,
-    ///                       otherwise normally off.
-    /// * `one_shot` - Only perform detection once if set to `true`, otherwise
-    ///             repeats conversion.
-    ///             ONE-SHOT MODE NOT SUPPORTED BY THIS DRIVER!
-    /// * `sensor_type` - Define whether a two, three or four wire sensor is
-    ///                   used. Two and Four wire sensors are indistinguishable.
-    /// * `filter_mode` - Specify the mains frequency that should be used to
-    ///                   filter out noise, e.g. 50Hz in Europe.
-    ///                   In continuous mode, temperatures are updated by the chip
-    ///                   at a 16 hz rate for 50 hz filter mode, and 19 hz rate for 60 hz
-    ///                   filter mode.
-    ///
-    /// # Remarks
-    ///
-    /// This will update the configuration register of the MAX31865 register. If
-    /// the device doesn't properly react to this, add a delay after calling
-    /// `new` to increase the time that the chip select line is set high.
-    ///
-    /// *Note*: The correct sensor configuration also requires changes to the
-    /// PCB! Make sure to read the data sheet concerning this.
-    pub fn configure(
-        &mut self,
-        vbias: bool,
-        conversion_mode: bool,
-        one_shot: bool,
-        sensor_type: SensorType,
-        filter_mode: FilterMode,
-    ) -> Result<(), Error> {
-        if one_shot { return Err(Error::ConfigError) };  // One_shot not yet supported.
-        let conf: u8 = ((vbias as u8) << 7)
-            | ((conversion_mode as u8) << 6)
-            | ((one_shot as u8) << 5)
-            | ((sensor_type as u8) << 4)
-            | (filter_mode as u8);
-
-        self.write(Register::CONFIG, conf)?;
-        self.clear_fault()?; // Unlatch any boot faults (mimics Adafruit init)
-
-        Ok(())
+#[derive(Debug, Clone, Copy)]
+pub enum RTDLeads {
+    Two = 2,
+    Three = 3,
+    Four = 4,
     }
 
-    /// Clear latched faults (config reg bit 1 = 1)
-    pub fn clear_fault(&mut self) -> Result<(), Error> {
-        self.write(Register::CONFIG, 0x02)
-    }
-
-    /// Read and clear fault status reg (0x07) for bit-level  diagnostics (u8 LSB)
-    pub fn read_fault_status(&mut self) -> Result<u8, Error> {
-        let status = self.read(Register::FAULT_STATUS)?;
-        self.clear_fault()?; // Clear after read (if auto-clear needed)
-        Ok(status)
-    }
-
-    /// Set the calibration reference resistance. This can be used to calibrate
-    /// inaccuracies of both the reference resistor and the PT100 element.
-    ///
-    /// # Arguments
-    ///
-    /// * `calib` - A 32-bit integer specifying the reference resistance in ohms
-    ///             multiplied by 100, e.g. `40000` for 400 Ohms
-    ///
-    /// # Remarks
-    ///
-    /// You can perform calibration by putting the sensor in boiling (100
-    /// degrees Celsius) water and then measuring the raw value using
-    /// `read_raw`. Calculate `calib` as `(13851 << 15) / raw >> 1`.
-    pub fn set_calibration(&mut self, calib: u32) {
-        self.calibration = calib;
-    }
-
-    /// Read the raw resistance value.
-    ///
-    /// # Remarks
-    ///
-    /// The output value is the value in Ohms multiplied by 100.
-    pub fn read_ohms(&mut self) -> Result<u32, Error> {
-        let raw = self.read_raw()?;
-        let ohms = ((raw >> 1) as u32 * self.calibration) >> 15;
-        Ok(ohms)
-    }
-
-    /// Read resistance in ohms as f64
-    pub fn read_resistance(&mut self) -> Result<f64, Error> {
-        let ohms_raw = self.read_ohms()?; // u32 *100;
-        Ok(ohms_raw as f64 / 100.0)
-    }
-
-    /// Read temperature in °C as f64
-    pub fn read_temperature(&mut self) -> Result<f64, Error> {
-        let temp_raw = self.read_default_conversion()?; // i32 *100
-        Ok(temp_raw as f64 / 100.0)
-    }
-
-    /// Read the raw resistance value and then perform conversion to degrees Celsius.
-    /// The output value is the value in degrees Celsius multiplied by 100.
-    pub fn read_default_conversion(&mut self) -> Result<i32, Error> {
-        let ohms = self.read_ohms()?;
-        let temp = temp_conversion::LOOKUP_VEC_PT100.lookup_temperature(ohms as i32);
-        Ok(temp)
-    }
-
-    /// Read the raw RTD value.
-    ///
-    /// # Remarks
-    ///
-    /// The raw value is the value of the combined MSB and LSB registers.
-    /// The first 15 bits specify the ohmic value in relation to the reference
-    /// resistor (i.e. 2^15 - 1 would be the exact same resistance as the reference
-    /// resistor). See manual for further information.
-    /// The last bit specifies if the conversion was successful.
-
-    pub fn read_raw(&mut self) -> Result<u16, Error> {
-        let buffer = self.read_two(Register::RTD_MSB)?; // Single read_two on MSB clocks MSB + LSB
-        let raw = ((buffer[0] as u16) << 8) | (buffer[1] as u16); // buffer[0] = MSB, [1] = LSB
-        if raw & 1 != 0 { // LSB bit 0 = 1 = fault during read
-            return Err(Error::MAXError);
-        }
-        Ok(raw)
-    }
-
-    fn read(&mut self, reg: Register) -> Result<u8, Error> {
-        let mut read_buffer = [0u8; 2]; // 2 bytes: dummy + data
-        let mut write_buffer = [0u8; 2];
-        write_buffer[0] = reg.read_address(); // Read addr for reg (e.g., 0x81 for 0x01)
-        write_buffer[1] = 0; // Dummy data
-        self.ncs.set_low().map_err(|_| Error::PinError)?;
-        self.spi
-            .transfer(&mut read_buffer, &write_buffer)
-            .map_err(|_| Error::SpiErrorTransfer)?;
-        self.ncs.set_high().map_err(|_| Error::PinError)?;
-        Ok(read_buffer[1]) // Return result (ignore dummy [0])
-    }
-
-    fn read_two(&mut self, reg: Register) -> Result<[u8; 2], Error> {
-        // The hardware is full duplex - you have to read and write the same number of bytes.
-        // The first byte you write is the register offset, and the remaining
-        // bytes are ignored when reading. To read two bytes you write three.
-        // The two bytes we read are in the last two of the three bytes read.
-        // NOTE: It reads and writes the minimum size of the read and write buffers
-        let mut read_buffer = [0u8; 3]; // 3 bytes: dummy + MSB + LSB
-        let mut write_buffer = [0u8; 3];
-        write_buffer[0] = reg.read_address(); // Read addr for reg (e.g., 0x81 for 0x01)
-        write_buffer[1] = 0; // Dummy for MSB
-        write_buffer[2] = 0; // Dummy for LSB
-        self.ncs.set_low().map_err(|_| Error::PinError)?;
-        self.spi
-            .transfer(&mut read_buffer, &write_buffer)
-            .map_err(|_| Error::SpiErrorTransfer)?;
-        self.ncs.set_high().map_err(|_| Error::PinError)?;
-        Ok([read_buffer[1], read_buffer[2]]) // Return MSB, LSB (ignore dummy [0])
-    }
-
-    fn write(&mut self, reg: Register, val: u8) -> Result<(), Error> {
-        self.ncs.set_low().map_err(|_| Error::PinError)?;
-        self.spi
-            .write(&[reg.write_address(), val])
-            .map_err(|_| Error::SpiErrorWrite)?;
-        self.ncs.set_high().map_err(|_| Error::PinError)?;
-        Ok(())
-    }
-}
-
-#[allow(non_camel_case_types)]
-#[allow(dead_code)]
-#[derive(Clone, Copy)]
-enum Register {    // All the lovely Max31856 register offsets
-    CONFIG = 0x00,
-    RTD_MSB = 0x01,
-    RTD_LSB = 0x02,
-    HIGH_FAULT_THRESHOLD_MSB = 0x03,
-    HIGH_FAULT_THRESHOLD_LSB = 0x04,
-    LOW_FAULT_THRESHOLD_MSB = 0x05,
-    LOW_FAULT_THRESHOLD_LSB = 0x06,
-    FAULT_STATUS = 0x07,
-}
-
-const R: u8 = 0 << 7;
-const W: u8 = 1 << 7;
-
-impl Register {
-    fn read_address(&self) -> u8 {
-        *self as u8 | R
-    }
-
-    fn write_address(&self) -> u8 {
-        *self as u8 | W
-    }
+#[derive(Debug, Clone, Copy)]
+pub enum FilterHz {
+    Fifty = 0,
+    Sixty = 1,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum FaultStatus {
-    ShortToGnd(&'static str),  // Bit 0: RTDIN- short to GND
-    OpenCircuit(&'static str),  // Bit 1: RTDIN+ open circuit
-    OverUnderVoltage(&'static str),  // Bit 2: Over/under voltage
-    OverTemperature(&'static str),  // Bit 3: Over temperature
-    HighThreshold(&'static str),  // Bit 7: RTD high threshold (infinite R)
-    // Add bits 4-6 if needed (reserved or future per datasheet 4.3)
+pub enum MaxFault {
+    RtdInMinusUndervoltage,    // Bit 0: RTDIN- undervoltage
+    RtdInPlusOvervoltage,      // Bit 1: RTDIN+ overvoltage
+    RtdInMinusOvervoltage,     // Bit 2: RTDIN- overvoltage
+    RtdInPlusOpen,             // Bit 3: RTDIN+ open circuit
+    RtdInMinusOpen,            // Bit 4: RTDIN- open circuit
+    RtdUnderOrOvertemp,        // Bit 5: RTD under/over temperature
+    RtdOverOrUnderBiasVoltage, // Bit 6: RTD over/under bias voltage
+    AutoConversionFault,       // Bit 7: Auto-conversion fault
 }
 
-/// Parse u8 fault status (reg 0x07) into Vec of set bits with descriptions (no_std safe).
-pub fn parse_fault_status(status: u8) -> Vec<FaultStatus> {
-    let mut faults = Vec::new();
-    if status & 0x01 != 0 {
-        faults.push(FaultStatus::ShortToGnd("RTDIN- short to GND (bit 0)"));
-    }
-    if status & 0x02 != 0 {
-        faults.push(FaultStatus::OpenCircuit("RTDIN+ open circuit (bit 1)"));
-    }
-    if status & 0x04 != 0 {
-        faults.push(FaultStatus::OverUnderVoltage("Over/under voltage (bit 2)"));
-    }
-    if status & 0x08 != 0 {
-        faults.push(FaultStatus::OverTemperature("Over temperature (bit 3)"));
-    }
-    if status & 0x80 != 0 {
-        faults.push(FaultStatus::HighThreshold("RTD high threshold (infinite R) (bit 7)"));
-    }
-    faults
-}
-use core::fmt;
-impl fmt::Display for FaultStatus {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+impl MaxFault {
+    /// Returns the bitmask (u8) for this fault type.
+    pub fn bit(self) -> u8 {
         match self {
-            FaultStatus::ShortToGnd(desc) => write!(f, "{}", desc),
-            FaultStatus::OpenCircuit(desc) => write!(f, "{}", desc),
-            FaultStatus::OverUnderVoltage(desc) => write!(f, "{}", desc),
-            FaultStatus::OverTemperature(desc) => write!(f, "{}", desc),
-            FaultStatus::HighThreshold(desc) => write!(f, "{}", desc),
-            // Add more variants as needed (e.g., if you expand bits 4-6)
+            MaxFault::RtdInMinusUndervoltage => 0b00000001,
+            MaxFault::RtdInPlusOvervoltage => 0b00000010,
+            MaxFault::RtdInMinusOvervoltage => 0b00000100,
+            MaxFault::RtdInPlusOpen => 0b00001000,
+            MaxFault::RtdInMinusOpen => 0b00010000,
+            MaxFault::RtdUnderOrOvertemp => 0b00100000,
+            MaxFault::RtdOverOrUnderBiasVoltage => 0b01000000,
+            MaxFault::AutoConversionFault => 0b10000000,
+        }
+    }
+
+    /// Returns a human-readable description for this fault.
+    pub fn description(self) -> &'static str {
+        match self {
+            MaxFault::RtdInMinusUndervoltage => "RTD IN- Undervoltage",
+            MaxFault::RtdInPlusOvervoltage => "RTD IN+ Overvoltage",
+            MaxFault::RtdInMinusOvervoltage => "RTD IN- Overvoltage",
+            MaxFault::RtdInPlusOpen => "RTD IN+ Open Circuit",
+            MaxFault::RtdInMinusOpen => "RTD IN- Open Circuit",
+            MaxFault::RtdUnderOrOvertemp => "RTD Under/Over Temperature",
+            MaxFault::RtdOverOrUnderBiasVoltage => "RTD Over/Under Bias Voltage",
+            MaxFault::AutoConversionFault => "Auto-Conversion Fault",
         }
     }
 }
+
+/// Public helper to decode a full fault status byte into a list of active faults (for users).
+/// Returns a Vec of descriptions for set bits; empty if no faults.
+pub fn decode_fault_status(status: u8) -> Vec<&'static str> {
+    let mut faults = Vec::new();
+    let all_faults = [
+        (MaxFault::RtdInMinusUndervoltage, 0b00000001),
+        (MaxFault::RtdInPlusOvervoltage, 0b00000010),
+        (MaxFault::RtdInMinusOvervoltage, 0b00000100),
+        (MaxFault::RtdInPlusOpen, 0b00001000),
+        (MaxFault::RtdInMinusOpen, 0b00010000),
+        (MaxFault::RtdUnderOrOvertemp, 0b00100000),
+        (MaxFault::RtdOverOrUnderBiasVoltage, 0b01000000),
+        (MaxFault::AutoConversionFault, 0b10000000),
+    ];
+    for (fault, bit) in all_faults {
+        if status & bit != 0 {
+            faults.push(fault.description());
+        }
+    }
+    faults
+}
+
+#[derive(Debug)]
+pub enum RtdError {
+    InvalidLeads,
+    InvalidFilter,
+    InvalidChipSelect,
+    Init(String),
+    Read(String),
+    Fault(u8),
+}
+pub trait ErrorOrAny: std::error::Error + Any {}
+impl ErrorOrAny for RtdError {}
+
+impl fmt::Display for RtdError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            RtdError::InvalidLeads => write!(f, "Invalid lead count"),
+            RtdError::InvalidFilter => write!(f, "Invalid filter frequency"),
+            RtdError::InvalidChipSelect => write!(f, "Invalid chip select pin"),
+            RtdError::Init(s) => write!(f, "Init error: {}", s),
+            RtdError::Read(s) => write!(f, "Read error: {}", s),
+            RtdError::Fault(status) => {
+                let descriptions = decode_fault_status(*status);
+                if descriptions.is_empty() {
+                    write!(f, "Fault status: {:#010b} (no active faults)", status)
+                } else {
+                    write!(f, "Fault status: {:#010b} ({})", status, descriptions.join(", "))
+                }
+            }
+        }
+    }
+}
+
+impl StdError for RtdError {}
+
+// Internal opaque holder - same for real/mock
+struct RtdInner {
+    spi: Box<dyn SpiBusTrait>,      // The SPI bus we're active on
+    cs: Box<dyn OutputPinTrait>,    // Chip select - active when low
+    calib: u32,
+}
+
+
+impl RtdReader {
+    /// Construct with CS GPIO number (BCM), lead count, and filter frequency.
+    /// Defaults: continuous mode, 400Ω ref resistor.
+    /// Fault pin fixed to GPIO25 (pullup input).
+    pub fn new(cs_pin: u8, leads: RTDLeads, filter: FilterHz) -> Result<Self, Box<dyn StdError + Send + Sync>> {
+        let lead_num = leads as u8;
+        if !(2..=4).contains(&lead_num) {
+            return Err(Box::new(RtdError::InvalidLeads) as Box<dyn StdError + Send + Sync>);
+        }
+        let filter_bit = filter as u8;
+        if filter_bit > 1 {
+            return Err(Box::new(RtdError::InvalidFilter) as Box<dyn StdError + Send + Sync>);
+        }
+        if cs_pin == 0 || cs_pin > 27 {
+            return Err(Box::new(RtdError::Init("Invalid chip select pin number".to_string())) as Box<dyn StdError + Send + Sync>);
+        }
+
+        #[cfg(not(feature = "mock"))]
+        {
+            // TODO: Understand if we need to provide parameters for these options
+            // Right now, I love the simplicity of the interface, but they might be needed.
+            let spi_result = RealSpi::new(Bus::Spi0, SlaveSelect::Ss0, 1_000_000, Mode::Mode3)
+                .map_err(|e| Box::new(RtdError::Init(e.to_string())) as Box<dyn StdError + Send + Sync>)?;
+            let spi = Box::new(spi_result) as Box<dyn SpiBusTrait>;  // Now this works—RealSpi impls the trait
+            let gpio = Gpio::new().map_err(|e| Box::new(RtdError::Init(e.to_string())) as Box<dyn StdError + Send + Sync>)?;
+            let cs = Box::new(
+                gpio.get(cs_pin)
+                    .map_err(|e| Box::new(RtdError::Init(e.to_string())) as Box<dyn StdError + Send + Sync>)?
+                    .into_output_high()
+            ) as Box<dyn OutputPinTrait>;
+
+            let mut inner = RtdInner { spi, cs, calib: 40000 };
+            inner.init(lead_num, filter_bit).map_err(|e| Box::new(e) as Box<dyn StdError + Send + Sync>)?;
+            Ok(Self { inner })
+        }
+
+        #[cfg(feature = "mock")]
+        {
+            let chip_state = Arc::new(RefCell::new(MockChipState::default()));
+            let spi = Box::new(MockSpiBus { state: chip_state.clone() }) as Box<dyn SpiBusTrait>;
+            let cs = Box::new(MockCsPin::default()) as Box<dyn OutputPinTrait>;
+
+            let mut inner = RtdInner { spi, cs, calib: 40000 };
+            inner.init(lead_num, filter_bit).map_err(|e| Box::new(e) as Box<dyn StdError + Send + Sync>)?;
+            Ok(Self { inner })
+        }
+    }
+
+    /// Read temperature in hundredths of °C (e.g., 2150 = 21.50°C).
+    /// Integer math only; auto-clears faults on error.
+    pub fn read_temp_100(&mut self) -> Result<i32, Box<dyn StdError + Send + Sync>> {
+        self.inner.read_temp_100()
+    }
+
+    /// Update reference resistor calibration (ohms * 100, default 40000).
+    pub fn set_calib(&mut self, calib: u32) {
+        self.inner.calib = calib;
+    }
+
+    /// Returns true if the error is a MAX31865 chip fault (e.g., open circuit, overtemp).
+    /// Use this to decide if you need to call `read_fault_status()` to clear and inspect.
+    pub fn is_max_fault(&self, e: &dyn ErrorOrAny) -> bool {
+        (e as &dyn Any).downcast_ref::<RtdError>().map_or(false, |err| matches!(err, RtdError::Fault(_)))
+    }
+
+    /// Read the MAX31865 fault status register (register 7).
+    /// Returns the raw u8 status byte; use `decode_fault_status` for human-readable descriptions.
+    /// Does not auto-clear faults—call `clear_fault` if needed after inspection.
+    pub fn read_fault_status(&mut self) -> Result<u8, Box<dyn StdError + Send + Sync>> {
+        self.inner.read_reg(7).map_err(|e| Box::new(e) as Box<dyn StdError + Send + Sync>)
+    }
+
+    /// Clear any active faults on the MAX31865 (writes to config register bits 6:4).
+    /// Call this after inspecting faults via `read_fault_status` to resume normal operation.
+    pub fn clear_fault(&mut self) -> Result<(), Box<dyn StdError + Send + Sync>> {
+        self.inner.clear_fault().map_err(|e| Box::new(e) as Box<dyn StdError + Send + Sync>)
+    }
+
+    #[cfg(not(feature = "no_fp"))]
+    pub fn get_temperature(&mut self) -> Result<f64, Box<dyn StdError + Send + Sync>> {
+        let temp100 = self.inner.read_temp_100()?;
+        Ok(temp100 as f64 / 100.0) // Convert
+    }
+
+    #[cfg(not(feature = "no_fp"))]
+    pub fn get_resistance(&mut self) -> Result<f64, Box<dyn StdError + Send + Sync>> {
+        let ohms100 = self.inner.read_ohms_100()?;
+        Ok(ohms100 as f64 / 100.0) // Convert
+    }
+
+    #[cfg(feature = "mock")]
+    /// Inject raw RTD value for mock (MSB/LSB; auto-injects LSB fault if bit0 set).
+    pub fn inject_rtd_raw(&mut self, raw: u16) {
+        if let Some(mock_spi) = self.inner.spi.as_any_mut().downcast_mut::<MockSpiBus>() {
+            mock_spi.state.borrow_mut().set_rtd_raw(raw);
+        }
+    }
+
+    #[cfg(feature = "mock")]
+    /// Inject fault bits into status reg (persists until cleared).
+    pub fn inject_fault(&mut self, bits: u8) {
+        if let Some(mock_spi) = self.inner.spi.as_any_mut().downcast_mut::<MockSpiBus>() {
+            mock_spi.state.borrow_mut().inject_fault(bits);
+        }
+    }
+
+    #[cfg(feature = "mock")]
+    /// Get current fault status for verification.
+    pub fn get_fault_status(&self) -> u8 {
+        if let Some(mock_spi) = self.inner.spi.as_any().downcast_ref::<MockSpiBus>() {
+            mock_spi.state.borrow().regs[7]
+        } else {
+            0
+        }
+    }
+}
+
+// Shared logic - exact same for real/mock (uses traits)
+impl RtdInner {
+    fn init(&mut self, leads: u8, filter: u8) -> Result<(), RtdError> {
+        self.cs.set_high();
+
+        // Config: bias on (7), auto-conversion on (6), one-shot off (5), leads (4), filter (0)
+        let mut conf: u8 = 0xC0;  // Bits 7-6 on
+        if leads == 3 { conf |= 0x10; }  // Bit 4 for 3-wire
+        conf |= filter;  // Bit 0 for 50/60Hz
+        self.write_reg(0x00, conf).map_err(|_| RtdError::Init("Config write failed".to_string()))?;
+
+        self.clear_fault().map_err(|_| RtdError::Init("Clear fault failed".to_string()))?;
+        Ok(())
+    }
+
+    fn read_ohms_100(&mut self) -> Result<u32, Box<dyn StdError + Send + Sync>> {
+        // Read RTD raw: 3-byte transfer for 2-byte data (addr + dummies)
+        self.cs.set_low();
+        let write_buf = [0x01 | 0x80, 0x00, 0x00];  // Write: Read RTD_MSB addr + dummies
+        let mut read_buf = [0x00, 0x00, 0x00];      // Read: Will be filled with dummy + MSB + LSB
+        let transferred = self.spi.transfer(&mut read_buf, &write_buf)
+            .map_err(|e| Box::new(RtdError::Read(format!("Transfer failed: {}", e))) as Box<dyn StdError + Send + Sync>)?;
+        self.cs.set_high();
+
+        if transferred != write_buf.len() {
+            return Err(Box::new(RtdError::Read(format!(
+                "Incomplete transfer: {} bytes (expected 3)", transferred
+            ))) as Box<dyn StdError + Send + Sync>);
+        }
+
+        let raw = u16::from_be_bytes([read_buf[1], read_buf[2]]);  // MSB in [1], LSB in [2]
+        if raw & 1 != 0 {
+            // LSB indicates a fault; read full status from reg 7 for complete details
+            match self.read_reg(7) {
+                Ok(full_status) => {
+                    Err(Box::new(RtdError::Fault(full_status)) as Box<dyn StdError + Send + Sync>)
+                }
+                Err(e) => {
+                    // Fallback if status read fails (e is already RtdError)
+                    Err(Box::new(e) as Box<dyn StdError + Send + Sync>)
+                }
+            }
+        } else {
+            // No fault: compute resistance (note: low-order bit is error bit, so shift right)
+            let ohms100 = (((raw >> 1) as u32 * self.calib) + (1u32 << 13)) >> 14;  // Round to nearest
+            Ok(ohms100)
+        }
+    }
+
+    fn read_temp_100(&mut self) -> Result<i32, Box<dyn StdError + Send + Sync>> {
+        // Simple integer PT100 approximation: T = 100 * (R/R0 - 1) / 0.00385
+        // Scaled to avoid floats: R0=10000 (100*100), alpha=385 (0.00385*100000)
+        let ohms100 = self.read_ohms_100()?; // Resistance in Ohms * 100
+        let r = ohms100 as i64;
+        let r0 = 10000i64;
+        let alpha = 385i64;
+        let num = (r * 100000) - (r0 * 100000);
+        let den = alpha * r0;
+        let temp = (num * 100) / den;  // Hundredths °C
+        Ok(temp as i32)
+    }
+
+    fn read_reg(&mut self, reg: u8) -> Result<u8, RtdError> {
+        self.cs.set_low();
+        let write_buf = [reg | 0x80, 0x00];  // Write: Read addr + dummy
+        let mut read_buf = [0x00, 0x00];     // Read: Will be filled with dummy + value
+        let transferred = self.spi.transfer(&mut read_buf, &write_buf)
+            .map_err(|_| RtdError::Read("SPI transfer failed".to_string()))?;
+        self.cs.set_high();
+        if transferred != 2 {
+            return Err(RtdError::Read(format!("Incomplete register read transfer: {} bytes (expected 2)", transferred)));
+        }
+        Ok(read_buf[1])
+    }
+
+    fn write_reg(&mut self, reg: u8, val: u8) -> Result<(), RtdError> {
+        self.cs.set_low();
+        let transferred = self.spi.write(&[reg, val])
+            .map_err(|_| RtdError::Read("SPI write failed".to_string()))?;
+        self.cs.set_high();
+        if transferred != 2 {
+            return Err(RtdError::Read(format!("Incomplete register write transfer: {} bytes (expected 2)", transferred)));
+        }
+        Ok(())
+    }
+
+    fn clear_fault(&mut self) -> Result<(), RtdError> {
+        let mut conf = self.read_reg(0x00)?;
+        conf |= 0x70;  // Bits 6:4 = 111 to clear faults
+        self.write_reg(0x00, conf)
+    }
+}
+
+// Traits require as_any/as_any_mut since SpiBusTrait: Any (for downcasting in mocks)
+#[allow(dead_code)]  // Suppress dead_code warning for non-mock builds (methods used only in mock)
+trait SpiBusTrait: Any {
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+    fn transfer(&mut self, read_buf: &mut [u8], write_buf: &[u8]) -> Result<usize, RtdError>;
+    fn write(&mut self, words: &[u8]) -> Result<usize, RtdError>;
+}
+
+trait OutputPinTrait {
+    fn set_high(&mut self) -> ();
+    fn set_low(&mut self) -> ();
+}
+
+// Real rppal impls (gated by not(mock))
+#[cfg(not(feature = "mock"))]
+#[derive(Debug)]
+struct RealSpi {
+    inner: rppal::spi::Spi,
+}
+
+#[cfg(not(feature = "mock"))]
+impl RealSpi {
+    fn new(bus: Bus, slave: SlaveSelect, freq: u32, mode: Mode) -> Result<Self, SpiError> {
+        rppal::spi::Spi::new(bus, slave, freq, mode).map(|inner| Self { inner })
+    }
+}
+
+#[cfg(not(feature = "mock"))]
+impl SpiBusTrait for RealSpi {
+    fn as_any(&self) -> &dyn Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+
+    fn transfer(&mut self, read_buf: &mut [u8], write_buf: &[u8]) -> Result<usize, RtdError> {
+        self.inner.transfer(read_buf, write_buf)
+            .map_err(|e| RtdError::Read(e.to_string()))
+    }
+
+    fn write(&mut self, words: &[u8]) -> Result<usize, RtdError> {
+        self.inner.write(words)
+            .map_err(|e| RtdError::Read(e.to_string()))
+    }
+}
+
+#[cfg(not(feature = "mock"))]
+impl OutputPinTrait for rppal::gpio::OutputPin {
+    fn set_high(&mut self) {
+        let _ = self.set_high();
+    }
+
+    fn set_low(&mut self) {
+        let _ = self.set_low();
+    }
+}
+
+/***********************************************************************************
+ *  Code from here to the end is just for mocking the behavior of the GPIO bus
+ *  and the Max31865 temperature sensing chip.
+ *  This is so we can test the behavior of the driver in the absence of hardware on any
+ *  Rust platform.
+ **********************************************************************************/
+
+// Mock hardware (gated by "mock" feature)
+#[cfg(feature = "mock")]
+#[derive(Default, Debug)]
+struct MockChipState {
+    regs: [u8; 8],  // 0: config, 1: RTD_MSB, 2: RTD_LSB, 7: fault_status
+    fault_pin_high: bool,
+}
+
+#[cfg(feature = "mock")]
+impl MockChipState {
+    fn set_rtd_raw(&mut self, raw: u16) {
+        self.regs[1] = (raw >> 8) as u8;
+        self.regs[2] = raw as u8;
+        if raw & 1 != 0 {
+            self.regs[7] |= 1;
+            self.fault_pin_high = true;
+        }
+        }
+
+    fn inject_fault(&mut self, bits: u8) {
+        self.regs[7] |= bits;
+        self.fault_pin_high = self.regs[7] != 0;
+    }
+    }
+
+#[cfg(feature = "mock")]
+#[derive(Debug, Default)]
+struct MockSpiBus {
+    state: Arc<RefCell<MockChipState>>,
+}
+
+#[cfg(feature = "mock")]
+impl SpiBusTrait for MockSpiBus {
+    fn as_any(&self) -> &dyn Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+
+    fn transfer(&mut self, read_buf: &mut [u8], write_buf: &[u8]) -> Result<usize, RtdError> {
+        let len = std::cmp::min(read_buf.len(), write_buf.len());
+        if len == 0 {
+            return Ok(0);
+        }
+
+        // Process from write_buf (commands/data), fill read_buf (responses/dummies)
+        let addr = write_buf[0];
+        let reg = addr & 0x7F;
+        let is_read = addr & 0x80 != 0;
+        let mut st = self.state.borrow_mut();
+
+        // Fill read_buf[0] with dummy (always, as per SPI protocol)
+        read_buf[0] = 0x00;
+
+        if !is_read {
+            // Write: Update state from write_buf[1...], fill read_buf[1..] with dummies
+            if len >= 2 && reg < 8 {
+                st.regs[reg as usize] = write_buf[1];
+                if reg == 0 && (write_buf[1] & 0x70) == 0x70 {
+                    st.regs[7] = 0;
+                    st.fault_pin_high = false;
+                }
+            }
+            for i in 1..len {
+                read_buf[i] = 0x00;  // Dummy response for writes
+            }
+        } else {
+            // Read: Fill read_buf[1..] from state
+            if len >= 2 && reg < 8 {
+                read_buf[1] = st.regs[reg as usize];
+            }
+            if reg == 1 && len >= 3 {
+                read_buf[1] = st.regs[1];
+                read_buf[2] = st.regs[2];
+                // Force LSB D0=1 on RTD reads if any fault active (per datasheet: faults invalidate conversion)
+                if st.regs[7] != 0 {
+                    read_buf[2] |= 1;
+                }
+            } else if len > 2 {
+                // Extra dummies for longer reads
+                for i in 2..len {
+                    read_buf[i] = 0x00;
+                }
+            }
+        }
+        Ok(len)
+    }
+
+    fn write(&mut self, words: &[u8]) -> Result<usize, RtdError> {
+        // Simulate write: transfer with dummy read_buf (zeros, discarded)
+        let len = words.len();
+        let mut dummy_read = vec![0u8; len];
+        let transferred = self.transfer(&mut dummy_read, words)?;
+        Ok(transferred)
+    }
+}
+
+#[cfg(feature = "mock")]
+#[derive(Default, Debug)]
+struct MockCsPin {
+    high: bool,
+}
+
+#[cfg(feature = "mock")]
+impl OutputPinTrait for MockCsPin {
+    fn set_high(&mut self) {
+        self.high = true;
+    }
+
+    fn set_low(&mut self) {
+        self.high = false;
+    }
+}
+
