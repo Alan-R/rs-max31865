@@ -2,7 +2,6 @@
 #[cfg(feature = "mock")]
 mod tests {
     use simple_max31865::{RtdReader, RTDLeads, FilterHz, RtdError, decode_fault_status, MaxFault, ErrorOrAny};
-    use std::error::Error as StdError;
     use std::panic;
 
     #[test]
@@ -19,6 +18,36 @@ mod tests {
         match result {
             Err(e) => assert!(matches!(&*e.downcast_ref::<RtdError>().unwrap(), RtdError::Init(_)), "Should be Init error from mock GPIO"),
             Ok(_) => panic!("Invalid CS pin should fail"),
+        }
+    }
+    #[test]
+    fn test_max_fault_bit_coverage() {
+        // Exercise all MaxFault variants to cover bit() match arms
+        let all_faults = [
+            MaxFault::RtdInMinusUndervoltage,
+            MaxFault::RtdInPlusOvervoltage,
+            MaxFault::RtdInMinusOvervoltage,
+            MaxFault::RtdInPlusOpen,
+            MaxFault::RtdInMinusOpen,
+            MaxFault::RtdUnderOrOvertemp,
+            MaxFault::RtdOverOrUnderBiasVoltage,
+            MaxFault::AutoConversionFault,
+        ];
+
+        let expected_bits = [
+            0b00000001,  // Undervoltage
+            0b00000010,  // Plus overvoltage
+            0b00000100,  // Minus overvoltage
+            0b00001000,  // Plus open
+            0b00010000,  // Minus open
+            0b00100000,  // Under/overtemp
+            0b01000000,  // Bias voltage
+            0b10000000,  // Auto-conversion
+        ];
+
+        for (fault, expected) in all_faults.iter().zip(expected_bits.iter()) {
+            let bit = fault.bit();
+            assert_eq!(bit, *expected, "bit() for {:?} should be {:#010b}", fault, expected);
         }
     }
 
@@ -252,6 +281,43 @@ mod tests {
     }
 
     #[test]
+    fn test_rtd_error_display() {
+        // InvalidLeads
+        let err = RtdError::InvalidLeads;
+        assert_eq!(err.to_string(), "Invalid lead count");
+
+        // InvalidFilter
+        let err = RtdError::InvalidFilter;
+        assert_eq!(err.to_string(), "Invalid filter frequency");
+
+        // InvalidChipSelect
+        let err = RtdError::InvalidChipSelect;
+        assert_eq!(err.to_string(), "Invalid chip select pin");
+
+        // Init(s)
+        let err = RtdError::Init("test init error".to_string());
+        assert_eq!(err.to_string(), "Init error: test init error");
+
+        // Read(s)
+        let err = RtdError::Read("test read error".to_string());
+        assert_eq!(err.to_string(), "Read error: test read error");
+
+        // Fault(status) - empty descriptions (status=0)
+        let err = RtdError::Fault(0u8);
+        assert_eq!(err.to_string(), "Fault status: 0b00000000 (no active faults)");
+
+        // Fault(status) - non-empty descriptions (status=1, single fault)
+        let err = RtdError::Fault(1u8);
+        let expected_fault = "Fault status: 0b00000001 (RTD IN- Undervoltage)";
+        assert_eq!(err.to_string(), expected_fault, "Fault with descriptions: {}", err.to_string());
+
+        // Fault(status) - multiple descriptions (status=3, two faults)
+        let err = RtdError::Fault(3u8);
+        let expected_fault = "Fault status: 0b00000011 (RTD IN- Undervoltage, RTD IN+ Overvoltage)";
+        assert_eq!(err.to_string(), expected_fault, "Multiple faults: {}", err.to_string());
+    }
+
+    #[test]
     #[cfg(not(feature = "no_fp"))]
     fn test_pt100_approximation_accuracy() {
         let mut reader = RtdReader::new(8, RTDLeads::Two, FilterHz::Fifty).unwrap();
@@ -287,6 +353,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_incomplete_transfer_error() {
+        let mut reader = RtdReader::new(8, RTDLeads::Two, FilterHz::Fifty).unwrap();
+
+        // Access mock to inject failure
+        reader.set_fail_transfer();
+
+        // Should trigger Read error from incomplete transfer
+        match reader.read_temp_100() {
+            Ok(_) => panic!("Incomplete transfer should fail"),
+            Err(e) => {
+                if let Some(err) = e.downcast_ref::<RtdError>() {
+                    match err {
+                        RtdError::Read(msg) => {
+                            assert!(msg.contains("Incomplete transfer: "), "Should mention incomplete transfer (got: {})", msg);
+                        }
+                        _ => panic!("Expected Read error"),
+                    }
+                } else {
+                    panic!("Expected RtdError");
+                }
+            }
+        }
+    }
 
     #[test]
     #[cfg(not(feature = "no_fp"))]
