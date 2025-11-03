@@ -1,31 +1,20 @@
 [package]
-name = "rs-max31865"
-version = "1.0.0"
-authors = ["Rudi Horn <dyn-git@rudi-horn.de>", "Emeric Martineau <11473190+emeric-martineau@users.noreply.github.com>"]
-keywords = ["embedded-hal-v1", "rtd-sensor", "max31865"]
+name = "simple_max31865"
+version = "0.1.0"
+authors = ["Alan Robertson <alanr@unix.sh>"]
+keywords = ["embedded-hal-v1", "rtd-sensor", "max31865", "spi"]
 categories = ["embedded", "no-std", "hardware-support"]
-description = "Generic driver for the MAX31865 RTD to Digital converter"
-documentation = "https://github.com/emeric-martineau/rs-max31865"
-repository = "https://github.com/emeric-martineau/rs-max31865.git"
+description = "Easy to Use driver for the MAX31865 RTD to Digital converter"
+documentation = "https://github.com/Alan-R/simple-max31865"
+homepage = "https://github.com/Alan-R/simple-max31865"
+repository = "https://github.com/Alan-R/simple-max31865"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
-edition = "2018"
+edition = "2021"
 
 [dependencies]
-embedded-hal = "1.0"
-embedded-hal-bus = "0.2"
-
-[target.thumbv7m-none-eabi.dev-dependencies]
-cortex-m-semihosting = "0.3.7"
-cortex-m = "0.7.2"
-cortex-m-rt = "0.6.13"
-panic-halt = "0.2.0"
-stm32f1xx-hal = { version = "0.7.0", features = ["stm32f103"] }
-embedded-graphics = "0.6.2"
-ssd1306 = "0.5.1"
-
-#[target.'cfg(unix)'.dev-dependencies]
-#linux-embedded-hal = "0.3.0"
+rppal = { version = "0.17", features = ["embedded-hal"] }  # Enables embedded-hal v1 traits for SpiBus, OutputPin, etc.
 
 [features]
-doc = []
+mock = [] # to enable mock hardware emulation
+no_fp = [] # to disable APIs that return floating point
