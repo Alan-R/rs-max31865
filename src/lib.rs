@@ -181,7 +181,10 @@ impl RtdReader {
         #[cfg(feature = "mock")]
         {
             let chip_state = Arc::new(RefCell::new(MockChipState::default()));
-            let spi = Box::new(MockSpiBus { state: chip_state.clone() }) as Box<dyn SpiBusTrait>;
+            let spi = Box::new(MockSpiBus {
+                state: chip_state.clone(),
+                fail_transfer: false,
+            }) as Box<dyn SpiBusTrait>;
             let cs = Box::new(MockCsPin::default()) as Box<dyn OutputPinTrait>;
 
             let mut inner = RtdInner { spi, cs, calib: 40000 };
@@ -257,6 +260,14 @@ impl RtdReader {
             0
         }
     }
+    #[cfg(feature = "mock")]
+    /// Set up next transfer to fail
+    pub fn set_fail_transfer(&mut self) {
+        if let Some(mock_spi) = self.inner.spi.as_any_mut().downcast_mut::<MockSpiBus>() {
+            mock_spi.set_fail_transfer();
+        }
+    }
+
 }
 
 // Shared logic - exact same for real/mock (uses traits)
@@ -359,6 +370,8 @@ trait SpiBusTrait: Any {
     fn as_any_mut(&mut self) -> &mut dyn Any;
     fn transfer(&mut self, read_buf: &mut [u8], write_buf: &[u8]) -> Result<usize, RtdError>;
     fn write(&mut self, words: &[u8]) -> Result<usize, RtdError>;
+    #[cfg(feature = "mock")]
+    fn set_fail_transfer(&mut self);
 }
 
 trait OutputPinTrait {
@@ -386,6 +399,7 @@ impl SpiBusTrait for RealSpi {
     fn as_any_mut(&mut self) -> &mut dyn Any { self }
 
     fn transfer(&mut self, read_buf: &mut [u8], write_buf: &[u8]) -> Result<usize, RtdError> {
+        // Test-only: Force failure for incomplete transfer coverage
         self.inner.transfer(read_buf, write_buf)
             .map_err(|e| RtdError::Read(e.to_string()))
     }
@@ -443,6 +457,8 @@ impl MockChipState {
 #[derive(Debug, Default)]
 struct MockSpiBus {
     state: Arc<RefCell<MockChipState>>,
+    #[cfg(feature = "mock")]
+    fail_transfer: bool,  // Test-only: Force incomplete transfer
 }
 
 #[cfg(feature = "mock")]
@@ -450,10 +466,18 @@ impl SpiBusTrait for MockSpiBus {
     fn as_any(&self) -> &dyn Any { self }
     fn as_any_mut(&mut self) -> &mut dyn Any { self }
 
+    fn set_fail_transfer(&mut self) {
+        self.fail_transfer = true;
+    }
+
     fn transfer(&mut self, read_buf: &mut [u8], write_buf: &[u8]) -> Result<usize, RtdError> {
         let len = std::cmp::min(read_buf.len(), write_buf.len());
         if len == 0 {
             return Ok(0);
+        }
+        if self.fail_transfer {
+            self.fail_transfer = false;
+            return Ok(254)
         }
 
         // Process from write_buf (commands/data), fill read_buf (responses/dummies)
@@ -504,6 +528,11 @@ impl SpiBusTrait for MockSpiBus {
         let len = words.len();
         let mut dummy_read = vec![0u8; len];
         let transferred = self.transfer(&mut dummy_read, words)?;
+        if transferred != len {
+            return Err(RtdError::Read(format!(
+                "Incomplete transfer: {} bytes (expected {})", transferred, len
+            )))
+        }
         Ok(transferred)
     }
 }

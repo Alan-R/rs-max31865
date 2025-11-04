@@ -43,6 +43,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Temperature: {:.2}°C", temperature);
     let resistance = max.get_resistance()?;
     println!("Resistance: {:.2} Ω", resistance);
+
+    match max.read_temp_100() {
+        Ok(temp) => println!("Temperature: {:.2}°C", temp as f64 / 100.0),
+        Err(e) => {
+            if max.is_max_fault(e) {
+                let status = max.read_fault_status();
+                println!("Fault: {:f?)", decode_fault_status(status));
+                max.clear_fault();
+            }
+            return Err(e);
+        }
+    }
     Ok(())
 }
 ```
